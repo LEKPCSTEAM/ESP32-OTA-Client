@@ -46,9 +46,9 @@ typedef std::function<void(int, int, int)> OTAProgressCallback;
  * @brief Update information structure
  */
 struct UpdateInfo {
-    bool available = false;   ///< True if update is available
-    String version = "";      ///< New version string
-    String url = "";          ///< Firmware download URL
+    bool available = false;  
+    String version = "";     
+    String url = "";         
 };
 
 /**
