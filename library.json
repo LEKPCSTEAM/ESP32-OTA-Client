@@ -1,6 +1,6 @@
 {
     "name": "ESP32-OTA-Client",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Lightweight OTA (Over-The-Air) update library for ESP32 with JSON API support",
     "keywords": [
         "esp32",
