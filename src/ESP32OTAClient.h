@@ -5,7 +5,7 @@
  * Supports JSON-based update server with version checking.
  *
  * Author: LEKPCSTEAM
- * Version: 1.0.1
+ * Version: 1.0.2
  * License: MIT
  *
  * GitHub: https://github.com/LEKPCSTEAM/ESP32-OTA-Client
@@ -38,6 +38,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <functional>
@@ -94,6 +95,59 @@ private:
     Serial.println(param);
   }
 
+  /**
+   * @brief Follow HTTP redirects and return final response code
+   * @param http HTTPClient instance
+   * @param url Initial URL to request
+   * @param maxRedirects Maximum number of redirects to follow (default 5)
+   * @return Final HTTP response code
+   */
+  int followRedirects(HTTPClient &http, const String &url,
+                      int maxRedirects = 5) {
+    String currentUrl = url;
+    int redirectCount = 0;
+
+    while (redirectCount < maxRedirects) {
+      // Determine if URL is HTTPS
+      bool isHttps = currentUrl.startsWith("https://");
+
+      if (isHttps) {
+        WiFiClientSecure *client = new WiFiClientSecure();
+        client->setInsecure(); // Skip certificate validation
+        http.begin(*client, currentUrl);
+      } else {
+        http.begin(currentUrl);
+      }
+
+      http.setTimeout(30000);
+      http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+      int httpCode = http.GET();
+
+      // Check if response is a redirect
+      if (httpCode == 301 || httpCode == 302 || httpCode == 307 ||
+          httpCode == 308) {
+        String newUrl = http.getLocation();
+        http.end();
+
+        if (newUrl.isEmpty()) {
+          log("Redirect without Location header");
+          return httpCode;
+        }
+
+        log("Following redirect to: ", newUrl.c_str());
+        currentUrl = newUrl;
+        redirectCount++;
+      } else {
+        // Not a redirect, return the response code
+        return httpCode;
+      }
+    }
+
+    log("Too many redirects");
+    return -1; // Too many redirects
+  }
+
 public:
   /**
    * @brief Construct OTA Client
@@ -122,9 +176,7 @@ public:
     log("Checking for updates...");
 
     HTTPClient http;
-    http.begin(_jsonUrl);
-    http.setTimeout(10000);
-    int httpCode = http.GET();
+    int httpCode = followRedirects(http, _jsonUrl);
 
     if (httpCode != 200) {
       log("Server error: ", String(httpCode).c_str());
@@ -215,9 +267,7 @@ public:
     log("Downloading firmware...");
 
     HTTPClient http;
-    http.begin(url);
-    http.setTimeout(30000);
-    int httpCode = http.GET();
+    int httpCode = followRedirects(http, url);
 
     if (httpCode != 200) {
       log("Download failed: ", String(httpCode).c_str());
