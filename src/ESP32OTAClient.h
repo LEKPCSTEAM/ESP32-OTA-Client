@@ -5,7 +5,7 @@
  * Supports JSON-based update server with version checking.
  *
  * Author: LEKPCSTEAM
- * Version: 1.0.2
+ * Version: 1.0.3
  * License: MIT
  *
  * GitHub: https://github.com/LEKPCSTEAM/ESP32-OTA-Client
@@ -17,6 +17,7 @@
  *   - Rollback to previous firmware version
  *   - Progress callback support
  *   - Periodic auto-check with setCheckInterval
+ *   - EEPROM-based duplicate prevention for force updates
  *
  * Server Response Format:
  *   {
@@ -24,7 +25,8 @@
  *       {
  *         "device": "ESP32-S3",
  *         "version": "1.0.1",
- *         "url": "http://example.com/firmware.bin"
+ *         "force": false,
+ *         "url": "http://example.com/firmware-v1.0.1-1766657621922.bin"
  *       }
  *     ]
  *   }
@@ -35,6 +37,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <EEPROM.h>
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFi.h>
@@ -42,6 +45,11 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <functional>
+
+// EEPROM
+#define OTA_EEPROM_SIZE 128
+#define OTA_EEPROM_START_ADDR 0
+#define OTA_EEPROM_MAGIC 0xAA55
 
 // Progress callback: (percent, bytesWritten, totalBytes)
 typedef std::function<void(int, int, int)> OTAProgressCallback;
@@ -51,8 +59,10 @@ typedef std::function<void(int, int, int)> OTAProgressCallback;
  */
 struct UpdateInfo {
   bool available = false;
+  bool force = false;
   String version = "";
   String url = "";
+  String filename = "";
 };
 
 /**
@@ -82,6 +92,8 @@ private:
   unsigned long _lastCheck = 0;
   unsigned long _checkInterval = 0;
   OTAProgressCallback _progressCallback = nullptr;
+  bool _eepromInitialized = false;
+  String _lastInstalledFilename = "";
   UpdateInfo _updateInfo;
 
   void log(const char *msg) {
@@ -93,6 +105,93 @@ private:
     Serial.print("[OTA] ");
     Serial.print(msg);
     Serial.println(param);
+  }
+
+  /**
+   * @brief Extract filename from URL
+   * @param url The firmware URL
+   * @return Filename extracted from URL
+   */
+  String extractFilename(const String &url) {
+    int lastSlash = url.lastIndexOf('/');
+    if (lastSlash >= 0 && lastSlash < (int)url.length() - 1) {
+      String filename = url.substring(lastSlash + 1);
+      // Remove query parameters if any
+      int queryIndex = filename.indexOf('?');
+      if (queryIndex > 0) {
+        filename = filename.substring(0, queryIndex);
+      }
+      return filename;
+    }
+    return "";
+  }
+
+  /**
+   * @brief Initialize EEPROM and load last installed filename
+   */
+  void initEEPROM() {
+    if (_eepromInitialized)
+      return;
+
+    EEPROM.begin(OTA_EEPROM_SIZE);
+
+    // Check magic number
+    uint16_t magic;
+    EEPROM.get(OTA_EEPROM_START_ADDR, magic);
+
+    if (magic == OTA_EEPROM_MAGIC) {
+      // Read stored filename length
+      uint8_t len = EEPROM.read(OTA_EEPROM_START_ADDR + 2);
+      if (len > 0 && len < OTA_EEPROM_SIZE - 3) {
+        char buffer[len + 1];
+        for (int i = 0; i < len; i++) {
+          buffer[i] = EEPROM.read(OTA_EEPROM_START_ADDR + 3 + i);
+        }
+        buffer[len] = '\0';
+        _lastInstalledFilename = String(buffer);
+        log("Last installed firmware: ", _lastInstalledFilename.c_str());
+      }
+    } else {
+      log("EEPROM not initialized, no previous firmware record");
+    }
+
+    _eepromInitialized = true;
+  }
+
+  /**
+   * @brief Save firmware filename to EEPROM
+   * @param filename The firmware filename to save
+   * @return true on success, false on error
+   */
+  bool saveFilenameToEEPROM(const String &filename) {
+    if (!_eepromInitialized) {
+      initEEPROM();
+    }
+
+    if (filename.length() >= OTA_EEPROM_SIZE - 3) {
+      log("Filename too long to save");
+      return false;
+    }
+
+    // Write magic number
+    EEPROM.put(OTA_EEPROM_START_ADDR, (uint16_t)OTA_EEPROM_MAGIC);
+
+    // Write filename length
+    EEPROM.write(OTA_EEPROM_START_ADDR + 2, (uint8_t)filename.length());
+
+    // Write filename
+    for (int i = 0; i < (int)filename.length(); i++) {
+      EEPROM.write(OTA_EEPROM_START_ADDR + 3 + i, filename.charAt(i));
+    }
+
+    if (EEPROM.commit()) {
+      _lastInstalledFilename = filename;
+      log("Saved firmware filename: ", filename.c_str());
+      return true;
+    }
+
+    log("Failed to save filename to EEPROM");
+    return false;
   }
 
   /**
@@ -157,6 +256,8 @@ public:
   OTAClient(const char *jsonUrl, const char *version) {
     _jsonUrl = jsonUrl;
     _currentVersion = version;
+    // Note: EEPROM initialization moved to hasUpdate() to ensure Serial is
+    // ready
   }
 
   /**
@@ -172,6 +273,10 @@ public:
    * @return true if update available, false otherwise
    */
   bool hasUpdate() {
+    // Initialize EEPROM on first call (after Serial is ready)
+    if (!_eepromInitialized) {
+      initEEPROM();
+    }
 
     log("Checking for updates...");
 
@@ -198,18 +303,41 @@ public:
     for (JsonObject config : configs) {
       String version = config["version"] | "";
       String url = config["url"] | "";
+      bool force = config["force"] | false;
+      String filename = extractFilename(url);
 
+      // For force update, check if firmware filename is different from last
+      // installed
+      if (force) {
+        if (!filename.isEmpty() && filename == _lastInstalledFilename) {
+          log("Force update skipped - same firmware: ", filename.c_str());
+          continue;
+        }
+        log("Force update: ", version.c_str());
+        log("New firmware file: ", filename.c_str());
+        _updateInfo.available = true;
+        _updateInfo.force = true;
+        _updateInfo.version = version;
+        _updateInfo.url = url;
+        _updateInfo.filename = filename;
+        return true;
+      }
+
+      // Normal version comparison
       if (version > _currentVersion) {
         log("Update available: ", version.c_str());
         _updateInfo.available = true;
+        _updateInfo.force = false;
         _updateInfo.version = version;
         _updateInfo.url = url;
+        _updateInfo.filename = filename;
         return true;
       }
     }
 
     log("Already up to date");
     _updateInfo.available = false;
+    _updateInfo.force = false;
     return false;
   }
 
@@ -320,6 +448,17 @@ public:
     http.end();
 
     if (Update.end(true)) {
+      // Save firmware filename to EEPROM before reboot
+      if (!_updateInfo.filename.isEmpty()) {
+        saveFilenameToEEPROM(_updateInfo.filename);
+      } else {
+        // Extract filename from URL if not already set
+        String filename = extractFilename(url);
+        if (!filename.isEmpty()) {
+          saveFilenameToEEPROM(filename);
+        }
+      }
+
       log("Update complete! Rebooting...");
       delay(500);
       ESP.restart();
@@ -454,6 +593,36 @@ public:
    * @return URL string
    */
   String getUrl() { return _jsonUrl; }
+
+  /**
+   * @brief Get last installed firmware filename from EEPROM
+   * @return Firmware filename string, empty if not set
+   */
+  String getLastInstalledFilename() { return _lastInstalledFilename; }
+
+  /**
+   * @brief Clear the last installed firmware record from EEPROM
+   * This allows force update to run again even with the same firmware filename
+   * @return true on success, false on error
+   */
+  bool clearFirmwareRecord() {
+    if (!_eepromInitialized) {
+      initEEPROM();
+    }
+
+    // Clear magic number to invalidate the record
+    EEPROM.write(OTA_EEPROM_START_ADDR, 0);
+    EEPROM.write(OTA_EEPROM_START_ADDR + 1, 0);
+
+    if (EEPROM.commit()) {
+      _lastInstalledFilename = "";
+      log("Firmware record cleared from EEPROM");
+      return true;
+    }
+
+    log("Failed to clear firmware record");
+    return false;
+  }
 };
 
 #endif // ESP32_OTA_CLIENT_H
