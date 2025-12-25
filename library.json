@@ -1,29 +1,23 @@
 {
-    "name": "ESP32-OTA-Client",
-    "version": "1.0.2",
-    "description": "Lightweight OTA (Over-The-Air) update library for ESP32 with JSON API support",
-    "keywords": [
-        "esp32",
-        "ota",
-        "update",
-        "firmware",
-        "wireless"
-    ],
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/LEKPCSTEAM/ESP32-OTA-Client.git"
-    },
-    "authors": [
-        {
-            "name": "LEKPCSTEAM",
-            "url": "https://github.com/LEKPCSTEAM"
-        }
-    ],
-    "license": "MIT",
-    "homepage": "https://github.com/LEKPCSTEAM/ESP32-OTA-Client",
-    "frameworks": "arduino",
-    "platforms": "espressif32",
-    "dependencies": {
-        "bblanchon/ArduinoJson": "^7.0.0"
+  "name": "ESP32-OTA-Client",
+  "version": "1.0.3",
+  "description": "Lightweight OTA (Over-The-Air) update library for ESP32 with JSON API support",
+  "keywords": ["esp32", "ota", "update", "firmware", "wireless"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LEKPCSTEAM/ESP32-OTA-Client.git"
+  },
+  "authors": [
+    {
+      "name": "LEKPCSTEAM",
+      "url": "https://github.com/LEKPCSTEAM"
     }
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/LEKPCSTEAM/ESP32-OTA-Client",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "bblanchon/ArduinoJson": "^7.0.0"
+  }
 }
