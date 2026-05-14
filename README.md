@@ -10,9 +10,18 @@ A lightweight OTA (Over-The-Air) update library for ESP32 with JSON API support.
 - ✅ **Rollback** to previous firmware version
 - ✅ **Firmware validation** with `markAsValid()`
 - ✅ **Partition status** checking (`getBootPartition()`, `getNextUpdatePartition()`)
-- ✅ **Progress callback** for download progress
+- ✅ **Progress callback** for download progress (legacy + stage-aware)
 - ✅ **Periodic auto-check** with `setCheckInterval()`
 - ✅ **Version comparison** (string-based)
+- ✅ **Filesystem (LittleFS / SPIFFS) OTA** — flash data partition alongside firmware (v1.1.0+)
+
+## What's New in 1.1.0
+
+- LittleFS / SPIFFS filesystem image OTA via `U_SPIFFS`
+- A single `update()` call now flashes filesystem first, then firmware, then reboots
+- New methods: `updateFilesystem()`, `doFilesystemUpdate(url)`, `hasFilesystemUpdate()`, `getLastInstalledFsFilename()`
+- New stage-aware progress callback overload — `(OTAStage, percent, written, total)`
+- 100% backwards compatible: existing JSON without `filesystem_url` and existing API calls behave exactly as in 1.0.x
 
 ## Installation
 
@@ -71,11 +80,15 @@ OTAClient ota(const char* jsonUrl, const char* version);
 
 | Method                     | Description                                    | Returns                                    |
 | -------------------------- | ---------------------------------------------- | ------------------------------------------ |
-| `hasUpdate()`              | Check if update available (no download)        | `bool`                                     |
-| `update()`                 | Download and install update                    | `int` (1=success, 0=no update, <0=error)   |
+| `hasUpdate()`              | Check if firmware OR filesystem update is available (no download) | `bool`                  |
+| `hasFilesystemUpdate()`    | Whether the cached UpdateInfo has a pending fs image | `bool`                               |
+| `update()`                 | Install fs (if any) then firmware (then reboot) | `int` (1=success, 0=no update, <0=error)  |
+| `updateFilesystem()`       | Install only the filesystem image (then reboot) | `int`                                     |
+| `doFilesystemUpdate(url)`  | Low-level: flash a fs image from a specific URL | `int`                                     |
 | `checkUpdate()`            | Check and auto-update if available             | `int`                                      |
 | `forceUpdate()`            | Clear cache and check/update                   | `int`                                      |
 | `getUpdateInfo()`          | Get cached update info                         | `UpdateInfo`                               |
+| `getLastInstalledFsFilename()` | Last successfully installed filesystem image filename | `String`                       |
 | `canRollback()`            | Check if rollback is possible                  | `bool`                                     |
 | `rollback()`               | Rollback to previous firmware                  | `int` (1=success, 0=no rollback, <0=error) |
 | `markAsValid()`            | Mark firmware as valid (prevent auto-rollback) | `bool`                                     |
@@ -88,9 +101,18 @@ OTAClient ota(const char* jsonUrl, const char* version);
 
 ### Progress Callback
 
+Two overloads are available — pick whichever you prefer:
+
 ```cpp
+// Legacy — same as v1.0.x
 ota.onProgress([](int percent, int bytesWritten, int totalBytes) {
     Serial.printf("Progress: %d%% (%d/%d)\n", percent, bytesWritten, totalBytes);
+});
+
+// Stage-aware — distinguishes firmware vs filesystem
+ota.onProgress([](OTAStage stage, int percent, int written, int total) {
+    const char* kind = (stage == OTA_STAGE_FIRMWARE) ? "FW" : "FS";
+    Serial.printf("[%s] %d%%\n", kind, percent);
 });
 ```
 
@@ -109,6 +131,46 @@ Your server should return JSON in this format:
   ]
 }
 ```
+
+### With filesystem image (v1.1.0+)
+
+Add the optional `filesystem_url` field — devices on v1.0.x will simply ignore it,
+while v1.1.0+ devices will flash the filesystem image alongside the firmware.
+
+```json
+{
+  "updater": [
+    {
+      "device": "ESP32-S3",
+      "version": "1.1.0",
+      "force": false,
+      "url":              "http://your-server/firmware-v1.1.0.bin",
+      "filesystem_url":   "http://your-server/littlefs-v1.1.0.bin",
+      "filesystem_version": "1.1.0"
+    }
+  ]
+}
+```
+
+Build the filesystem image with PlatformIO:
+
+```bash
+pio run --target buildfs
+# output: .pio/build/<env>/littlefs.bin
+```
+
+### Update Order
+
+When both URLs are present, `update()` does:
+
+1. Flash the **filesystem** to the data partition (no reboot).
+   While this runs, the running firmware should NOT touch LittleFS — close
+   any open files / call `LittleFS.end()` first.
+2. Flash the **firmware** to the inactive OTA partition.
+3. Reboot into the new firmware, which mounts the new filesystem.
+
+Filesystem-only updates (no `url`) flash the data partition then reboot so
+the new image is mounted cleanly.
 
 ## Examples
 
@@ -146,6 +208,30 @@ void loop() {
     }
 }
 ```
+
+### Firmware + Filesystem Update
+
+```cpp
+#include <LittleFS.h>
+
+void setup() {
+    LittleFS.begin(true);
+    // ... wifi connect ...
+
+    if (ota.hasUpdate()) {
+        UpdateInfo info = ota.getUpdateInfo();
+
+        // Stop using LittleFS before the data partition is flashed
+        if (info.filesystemAvailable) {
+            LittleFS.end();
+        }
+
+        ota.update();  // flashes fs first, then firmware, then reboots
+    }
+}
+```
+
+See `examples/FilesystemUpdate/FilesystemUpdate.ino` for the full flow.
 
 ### Periodic Auto-Check
 
