@@ -463,7 +463,11 @@ public:
       bool fsAvailable = false;
 
       // --- Firmware decision ---
-      if (force) {
+      if (!version.isEmpty() && version == _currentVersion) {
+        // If version matches exactly, we never update (prevents loops)
+        log("Firmware version is current: ", version.c_str());
+        fwAvailable = false;
+      } else if (force) {
         if (!filename.isEmpty() && filename == _lastInstalledFilename) {
           log("Force firmware update skipped - same file: ", filename.c_str());
         } else if (!url.isEmpty()) {
