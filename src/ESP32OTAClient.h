@@ -3,9 +3,10 @@
  *
  * A lightweight OTA (Over-The-Air) update library for ESP32.
  * Supports JSON-based update server with version checking.
+ * Supports BOTH firmware (app) and filesystem (LittleFS/SPIFFS) updates.
  *
  * Author: LEKPCSTEAM
- * Version: 1.0.3
+ * Version: 1.1.0
  * License: MIT
  *
  * GitHub: https://github.com/LEKPCSTEAM/ESP32-OTA-Client
@@ -15,9 +16,11 @@
  *   - Update on demand (update)
  *   - Auto-update on check (checkUpdate)
  *   - Rollback to previous firmware version
- *   - Progress callback support
+ *   - Progress callback support (per-stage)
  *   - Periodic auto-check with setCheckInterval
  *   - EEPROM-based duplicate prevention for force updates
+ *   - NEW: Filesystem (LittleFS/SPIFFS) OTA via U_SPIFFS partition
+ *   - NEW: Combined firmware + filesystem update in a single call
  *
  * Server Response Format:
  *   {
@@ -26,10 +29,19 @@
  *         "device": "ESP32-S3",
  *         "version": "1.0.1",
  *         "force": false,
- *         "url": "http://example.com/firmware-v1.0.1-1766657621922.bin"
+ *         "url": "http://example.com/firmware-v1.0.1.bin",
+ *
+ *         // Optional filesystem image (LittleFS / SPIFFS):
+ *         "filesystem_url": "http://example.com/littlefs-v1.0.1.bin",
+ *         "filesystem_version": "1.0.1"
  *       }
  *     ]
  *   }
+ *
+ * Backwards compatibility:
+ *   - JSON without filesystem_url behaves identically to v1.0.x
+ *   - Existing API signatures unchanged; firmware-only deployments keep working
+ *   - EEPROM v1 records are still read; new records use an extended v2 layout
  */
 
 #ifndef ESP32_OTA_CLIENT_H
@@ -47,22 +59,42 @@
 #include <functional>
 
 // EEPROM
-#define OTA_EEPROM_SIZE 128
+// Bumped from 128 to 256 to fit both firmware + filesystem filenames.
+// Old (v1.0.x) records inside the first 128 bytes are still read correctly.
+#define OTA_EEPROM_SIZE 256
 #define OTA_EEPROM_START_ADDR 0
-#define OTA_EEPROM_MAGIC 0xAA55
+#define OTA_EEPROM_MAGIC 0xAA55     // v1: firmware filename only
+#define OTA_EEPROM_MAGIC_V2 0xAA56  // v2: firmware + filesystem filenames
 
-// Progress callback: (percent, bytesWritten, totalBytes)
+// Update stage identifiers (passed to OTAProgressCallback)
+enum OTAStage {
+  OTA_STAGE_FIRMWARE = 0,
+  OTA_STAGE_FILESYSTEM = 1
+};
+
+// Progress callback signatures.
+//   Legacy:  (percent, bytesWritten, totalBytes)
+//   Stage:   (stage, percent, bytesWritten, totalBytes)
+// Both can be registered; the stage-aware one takes precedence when present.
 typedef std::function<void(int, int, int)> OTAProgressCallback;
+typedef std::function<void(OTAStage, int, int, int)> OTAStageProgressCallback;
 
 /**
  * @brief Update information structure
  */
 struct UpdateInfo {
+  // Firmware
   bool available = false;
   bool force = false;
   String version = "";
   String url = "";
   String filename = "";
+
+  // Filesystem (LittleFS / SPIFFS) — optional
+  bool filesystemAvailable = false;
+  String filesystemUrl = "";
+  String filesystemFilename = "";
+  String filesystemVersion = "";
 };
 
 /**
@@ -78,7 +110,7 @@ struct UpdateInfo {
  *     WiFi.begin("SSID", "PASSWORD");
  *     while (!WiFi.isConnected()) delay(100);
  *
- *     // Check and update
+ *     // Single call updates filesystem (if any) then firmware (then reboots)
  *     if (ota.hasUpdate()) {
  *         ota.update();
  *     }
@@ -92,8 +124,10 @@ private:
   unsigned long _lastCheck = 0;
   unsigned long _checkInterval = 0;
   OTAProgressCallback _progressCallback = nullptr;
+  OTAStageProgressCallback _stageProgressCallback = nullptr;
   bool _eepromInitialized = false;
   String _lastInstalledFilename = "";
+  String _lastInstalledFsFilename = "";
   UpdateInfo _updateInfo;
 
   void log(const char *msg) {
@@ -109,14 +143,11 @@ private:
 
   /**
    * @brief Extract filename from URL
-   * @param url The firmware URL
-   * @return Filename extracted from URL
    */
   String extractFilename(const String &url) {
     int lastSlash = url.lastIndexOf('/');
     if (lastSlash >= 0 && lastSlash < (int)url.length() - 1) {
       String filename = url.substring(lastSlash + 1);
-      // Remove query parameters if any
       int queryIndex = filename.indexOf('?');
       if (queryIndex > 0) {
         filename = filename.substring(0, queryIndex);
@@ -127,7 +158,10 @@ private:
   }
 
   /**
-   * @brief Initialize EEPROM and load last installed filename
+   * @brief Initialize EEPROM and load last-installed filenames
+   *
+   * Reads either v1 (firmware only) or v2 (firmware + filesystem) records.
+   * v1 records remain valid forever; v2 records are written by this version.
    */
   void initEEPROM() {
     if (_eepromInitialized)
@@ -135,21 +169,38 @@ private:
 
     EEPROM.begin(OTA_EEPROM_SIZE);
 
-    // Check magic number
     uint16_t magic;
     EEPROM.get(OTA_EEPROM_START_ADDR, magic);
 
-    if (magic == OTA_EEPROM_MAGIC) {
-      // Read stored filename length
-      uint8_t len = EEPROM.read(OTA_EEPROM_START_ADDR + 2);
-      if (len > 0 && len < OTA_EEPROM_SIZE - 3) {
-        char buffer[len + 1];
-        for (int i = 0; i < len; i++) {
-          buffer[i] = EEPROM.read(OTA_EEPROM_START_ADDR + 3 + i);
+    if (magic == OTA_EEPROM_MAGIC || magic == OTA_EEPROM_MAGIC_V2) {
+      int addr = OTA_EEPROM_START_ADDR + 2;
+
+      // Firmware filename (always present in both v1 and v2)
+      uint8_t fwLen = EEPROM.read(addr++);
+      if (fwLen > 0 && fwLen < OTA_EEPROM_SIZE - 4) {
+        char buffer[fwLen + 1];
+        for (int i = 0; i < fwLen; i++) {
+          buffer[i] = EEPROM.read(addr++);
         }
-        buffer[len] = '\0';
+        buffer[fwLen] = '\0';
         _lastInstalledFilename = String(buffer);
         log("Last installed firmware: ", _lastInstalledFilename.c_str());
+      } else {
+        addr += fwLen; // skip past whatever's there
+      }
+
+      // Filesystem filename (v2 only)
+      if (magic == OTA_EEPROM_MAGIC_V2) {
+        uint8_t fsLen = EEPROM.read(addr++);
+        if (fsLen > 0 && fsLen < OTA_EEPROM_SIZE - (addr - OTA_EEPROM_START_ADDR)) {
+          char buffer[fsLen + 1];
+          for (int i = 0; i < fsLen; i++) {
+            buffer[i] = EEPROM.read(addr++);
+          }
+          buffer[fsLen] = '\0';
+          _lastInstalledFsFilename = String(buffer);
+          log("Last installed filesystem: ", _lastInstalledFsFilename.c_str());
+        }
       }
     } else {
       log("EEPROM not initialized, no previous firmware record");
@@ -159,47 +210,56 @@ private:
   }
 
   /**
-   * @brief Save firmware filename to EEPROM
-   * @param filename The firmware filename to save
-   * @return true on success, false on error
+   * @brief Persist firmware + filesystem filenames to EEPROM (v2 layout)
    */
-  bool saveFilenameToEEPROM(const String &filename) {
+  bool saveFilenamesToEEPROM(const String &fwFilename, const String &fsFilename) {
     if (!_eepromInitialized) {
       initEEPROM();
     }
 
-    if (filename.length() >= OTA_EEPROM_SIZE - 3) {
-      log("Filename too long to save");
+    // Need: 2 (magic) + 1 + fwLen + 1 + fsLen
+    if ((int)fwFilename.length() + (int)fsFilename.length() + 4 >= OTA_EEPROM_SIZE) {
+      log("Filenames too long to save");
       return false;
     }
 
-    // Write magic number
-    EEPROM.put(OTA_EEPROM_START_ADDR, (uint16_t)OTA_EEPROM_MAGIC);
+    EEPROM.put(OTA_EEPROM_START_ADDR, (uint16_t)OTA_EEPROM_MAGIC_V2);
+    int addr = OTA_EEPROM_START_ADDR + 2;
 
-    // Write filename length
-    EEPROM.write(OTA_EEPROM_START_ADDR + 2, (uint8_t)filename.length());
+    EEPROM.write(addr++, (uint8_t)fwFilename.length());
+    for (int i = 0; i < (int)fwFilename.length(); i++) {
+      EEPROM.write(addr++, fwFilename.charAt(i));
+    }
 
-    // Write filename
-    for (int i = 0; i < (int)filename.length(); i++) {
-      EEPROM.write(OTA_EEPROM_START_ADDR + 3 + i, filename.charAt(i));
+    EEPROM.write(addr++, (uint8_t)fsFilename.length());
+    for (int i = 0; i < (int)fsFilename.length(); i++) {
+      EEPROM.write(addr++, fsFilename.charAt(i));
     }
 
     if (EEPROM.commit()) {
-      _lastInstalledFilename = filename;
-      log("Saved firmware filename: ", filename.c_str());
+      _lastInstalledFilename = fwFilename;
+      _lastInstalledFsFilename = fsFilename;
+      log("Saved firmware filename: ", fwFilename.c_str());
+      if (fsFilename.length() > 0) {
+        log("Saved filesystem filename: ", fsFilename.c_str());
+      }
       return true;
     }
 
-    log("Failed to save filename to EEPROM");
+    log("Failed to save filenames to EEPROM");
     return false;
   }
 
   /**
+   * @brief Save only the firmware filename (preserves existing fs filename)
+   *        Used by the legacy single-stage code path.
+   */
+  bool saveFilenameToEEPROM(const String &filename) {
+    return saveFilenamesToEEPROM(filename, _lastInstalledFsFilename);
+  }
+
+  /**
    * @brief Follow HTTP redirects and return final response code
-   * @param http HTTPClient instance
-   * @param url Initial URL to request
-   * @param maxRedirects Maximum number of redirects to follow (default 5)
-   * @return Final HTTP response code
    */
   int followRedirects(HTTPClient &http, const String &url,
                       int maxRedirects = 5) {
@@ -207,12 +267,11 @@ private:
     int redirectCount = 0;
 
     while (redirectCount < maxRedirects) {
-      // Determine if URL is HTTPS
       bool isHttps = currentUrl.startsWith("https://");
 
       if (isHttps) {
         WiFiClientSecure *client = new WiFiClientSecure();
-        client->setInsecure(); // Skip certificate validation
+        client->setInsecure();
         http.begin(*client, currentUrl);
       } else {
         http.begin(currentUrl);
@@ -223,7 +282,6 @@ private:
 
       int httpCode = http.GET();
 
-      // Check if response is a redirect
       if (httpCode == 301 || httpCode == 302 || httpCode == 307 ||
           httpCode == 308) {
         String newUrl = http.getLocation();
@@ -238,42 +296,132 @@ private:
         currentUrl = newUrl;
         redirectCount++;
       } else {
-        // Not a redirect, return the response code
         return httpCode;
       }
     }
 
     log("Too many redirects");
-    return -1; // Too many redirects
+    return -1;
+  }
+
+  /**
+   * @brief Emit progress to whichever callback the user registered.
+   */
+  void emitProgress(OTAStage stage, int percent, int written, int total) {
+    if (_stageProgressCallback) {
+      _stageProgressCallback(stage, percent, written, total);
+    } else if (_progressCallback) {
+      _progressCallback(percent, written, total);
+    } else if (percent % 10 == 0) {
+      Serial.printf("[OTA] %s progress: %d%%\n",
+                    stage == OTA_STAGE_FIRMWARE ? "Firmware" : "Filesystem",
+                    percent);
+    }
+  }
+
+  /**
+   * @brief Shared download + flash routine for either U_FLASH or U_SPIFFS.
+   *
+   * @param url        URL to download from
+   * @param updateType U_FLASH (firmware) or U_SPIFFS (filesystem)
+   * @param stage      Stage identifier passed to the progress callback
+   * @return 1 on success, negative error code otherwise.
+   *         Note: U_FLASH does NOT reboot here — caller decides when to reboot.
+   *               (Old behavior was to reboot inside doUpdate — see doUpdate
+   *               wrapper which preserves that for the legacy code path.)
+   */
+  int downloadAndFlash(const String &url, int updateType, OTAStage stage) {
+    const char *kind = (updateType == U_FLASH) ? "firmware" : "filesystem";
+    log("Downloading ", kind);
+
+    HTTPClient http;
+    int httpCode = followRedirects(http, url);
+
+    if (httpCode != 200) {
+      log("Download failed: ", String(httpCode).c_str());
+      http.end();
+      return -3;
+    }
+
+    int contentLength = http.getSize();
+    if (contentLength <= 0) {
+      log("Invalid content length");
+      http.end();
+      return -3;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+
+    if (!Update.begin(contentLength, updateType)) {
+      log("Not enough space for update");
+      http.end();
+      return -4;
+    }
+
+    log("Installing...");
+
+    int written = 0;
+    int lastPercent = -1;
+    uint8_t buff[512];
+
+    while (http.connected() && written < contentLength) {
+      int available = stream->available();
+      if (available > 0) {
+        int len = stream->readBytes(buff, min(available, (int)sizeof(buff)));
+        Update.write(buff, len);
+        written += len;
+
+        int percent = (written * 100) / contentLength;
+        if (percent != lastPercent) {
+          lastPercent = percent;
+          emitProgress(stage, percent, written, contentLength);
+        }
+      }
+      delay(1);
+    }
+
+    http.end();
+
+    if (!Update.end(true)) {
+      log("Update failed");
+      return -5;
+    }
+
+    return 1;
   }
 
 public:
   /**
    * @brief Construct OTA Client
-   * @param jsonUrl URL to JSON API endpoint
-   * @param version Current firmware version (e.g., "1.0.0")
    */
   OTAClient(const char *jsonUrl, const char *version) {
     _jsonUrl = jsonUrl;
     _currentVersion = version;
-    // Note: EEPROM initialization moved to hasUpdate() to ensure Serial is
-    // ready
   }
 
   /**
-   * @brief Set progress callback
-   * @param callback Function(int percent, int bytesWritten, int totalBytes)
+   * @brief Set legacy progress callback (firmware-only signature)
    */
   void onProgress(OTAProgressCallback callback) {
     _progressCallback = callback;
   }
 
   /**
+   * @brief Set stage-aware progress callback.
+   *        Receives OTA_STAGE_FIRMWARE or OTA_STAGE_FILESYSTEM as 1st arg.
+   *        Takes precedence over onProgress() when both are set.
+   */
+  void onProgress(OTAStageProgressCallback callback) {
+    _stageProgressCallback = callback;
+  }
+
+  /**
    * @brief Check if update is available (does NOT download)
-   * @return true if update available, false otherwise
+   *
+   * Populates _updateInfo with both firmware and (optional) filesystem fields.
+   * Returns true if EITHER firmware or filesystem update is available.
    */
   bool hasUpdate() {
-    // Initialize EEPROM on first call (after Serial is ready)
     if (!_eepromInitialized) {
       initEEPROM();
     }
@@ -306,31 +454,59 @@ public:
       bool force = config["force"] | false;
       String filename = extractFilename(url);
 
-      // For force update, check if firmware filename is different from last
-      // installed
-      if (force) {
+      // Optional filesystem fields (absent in legacy server responses)
+      String fsUrl = config["filesystem_url"] | "";
+      String fsVersion = config["filesystem_version"] | "";
+      String fsFilename = extractFilename(fsUrl);
+
+      bool fwAvailable = false;
+      bool fsAvailable = false;
+
+      // --- Firmware decision ---
+      if (!version.isEmpty() && version == _currentVersion) {
+        // If version matches exactly, we never update (prevents loops)
+        log("Firmware version is current: ", version.c_str());
+        fwAvailable = false;
+      } else if (force) {
         if (!filename.isEmpty() && filename == _lastInstalledFilename) {
-          log("Force update skipped - same firmware: ", filename.c_str());
-          continue;
+          log("Force firmware update skipped - same file: ", filename.c_str());
+        } else if (!url.isEmpty()) {
+          log("Force firmware update: ", version.c_str());
+          fwAvailable = true;
         }
-        log("Force update: ", version.c_str());
-        log("New firmware file: ", filename.c_str());
-        _updateInfo.available = true;
-        _updateInfo.force = true;
-        _updateInfo.version = version;
-        _updateInfo.url = url;
-        _updateInfo.filename = filename;
-        return true;
+      } else if (!url.isEmpty() && version > _currentVersion) {
+        log("Firmware update available: ", version.c_str());
+        fwAvailable = true;
       }
 
-      // Normal version comparison
-      if (version > _currentVersion) {
-        log("Update available: ", version.c_str());
-        _updateInfo.available = true;
-        _updateInfo.force = false;
+      // --- Filesystem decision ---
+      // Filesystem is updated whenever the filename differs from the last one
+      // we installed. Force flag also forces a filesystem reinstall.
+      if (!fsUrl.isEmpty()) {
+        if (force) {
+          if (fsFilename != _lastInstalledFsFilename) {
+            log("Force filesystem update: ", fsFilename.c_str());
+            fsAvailable = true;
+          } else {
+            log("Force filesystem update skipped - same file: ",
+                fsFilename.c_str());
+          }
+        } else if (fsFilename != _lastInstalledFsFilename) {
+          log("Filesystem update available: ", fsFilename.c_str());
+          fsAvailable = true;
+        }
+      }
+
+      if (fwAvailable || fsAvailable) {
+        _updateInfo.available = fwAvailable;
+        _updateInfo.force = force;
         _updateInfo.version = version;
         _updateInfo.url = url;
         _updateInfo.filename = filename;
+        _updateInfo.filesystemAvailable = fsAvailable;
+        _updateInfo.filesystemUrl = fsUrl;
+        _updateInfo.filesystemFilename = fsFilename;
+        _updateInfo.filesystemVersion = fsVersion;
         return true;
       }
     }
@@ -338,140 +514,164 @@ public:
     log("Already up to date");
     _updateInfo.available = false;
     _updateInfo.force = false;
+    _updateInfo.filesystemAvailable = false;
     return false;
   }
 
   /**
-   * @brief Perform update (call hasUpdate first or use directly)
+   * @brief Convenience: check if a filesystem update is pending
+   *        (call hasUpdate() first).
+   */
+  bool hasFilesystemUpdate() { return _updateInfo.filesystemAvailable; }
+
+  /**
+   * @brief Perform update (call hasUpdate first or use directly).
+   *
+   * Order of operations when both updates are present:
+   *   1. Flash filesystem (no reboot — running firmware keeps executing,
+   *      LittleFS should NOT be accessed between flash and reboot).
+   *   2. Flash firmware (auto-reboots into new image, which then mounts the
+   *      newly-flashed filesystem).
+   *
+   * Filesystem-only updates trigger a reboot at the end so the new image is
+   * mounted cleanly.
+   *
    * @return 1 on success (will reboot), 0 if no update, negative on error
    */
   int update() {
+    if (!_updateInfo.available && !_updateInfo.filesystemAvailable) {
+      if (!hasUpdate()) {
+        log("No update available");
+        return 0;
+      }
+    }
+
+    int fsResult = 1;
+    if (_updateInfo.filesystemAvailable && !_updateInfo.filesystemUrl.isEmpty()) {
+      log("Updating filesystem to: ",
+          _updateInfo.filesystemFilename.c_str());
+      fsResult = downloadAndFlash(_updateInfo.filesystemUrl, U_SPIFFS,
+                                  OTA_STAGE_FILESYSTEM);
+      if (fsResult < 0) {
+        log("Filesystem update failed; aborting before firmware flash");
+        return fsResult;
+      }
+      // Persist immediately so a power loss between fs and firmware flash
+      // doesn't cause us to re-flash the same fs image next boot.
+      saveFilenamesToEEPROM(_lastInstalledFilename,
+                            _updateInfo.filesystemFilename);
+    }
+
     if (_updateInfo.available && !_updateInfo.url.isEmpty()) {
-      log("Updating to: ", _updateInfo.version.c_str());
+      log("Updating firmware to: ", _updateInfo.version.c_str());
       return doUpdate(_updateInfo.url);
     }
 
-    if (hasUpdate()) {
-      return doUpdate(_updateInfo.url);
+    // Filesystem-only path — reboot so the freshly flashed image is mounted.
+    if (_updateInfo.filesystemAvailable) {
+      log("Filesystem-only update complete. Rebooting...");
+      delay(500);
+      ESP.restart();
+      return 1;
     }
 
-    log("No update available");
     return 0;
   }
 
   /**
    * @brief Get cached update info (call hasUpdate first)
-   * @return UpdateInfo struct with version and URL
    */
   UpdateInfo getUpdateInfo() { return _updateInfo; }
 
   /**
    * @brief Check for update and install if available
-   * @return 1 on success (will reboot), 0 if up to date, negative on error
    */
   int checkUpdate() {
     if (hasUpdate()) {
-      return doUpdate(_updateInfo.url);
+      return update();
     }
     return 0;
   }
 
   /**
    * @brief Force check and update (clears cache first)
-   * @return 1 on success (will reboot), 0 if up to date, negative on error
    */
   int forceUpdate() {
     log("Force update check...");
     _updateInfo.available = false;
+    _updateInfo.filesystemAvailable = false;
     return checkUpdate();
   }
 
   /**
-   * @brief Download and install firmware from URL
-   * @param url Firmware binary URL
-   * @return 1 on success (will reboot), negative on error
+   * @brief Download and install firmware from URL.
+   *
+   * NOTE: This is the legacy single-stage entry point. It reboots on success,
+   * matching v1.0.x behavior — callers that want the multi-stage flow should
+   * use update() instead.
    */
   int doUpdate(const String &url) {
-    log("Downloading firmware...");
-
-    HTTPClient http;
-    int httpCode = followRedirects(http, url);
-
-    if (httpCode != 200) {
-      log("Download failed: ", String(httpCode).c_str());
-      http.end();
-      return -3;
+    int result = downloadAndFlash(url, U_FLASH, OTA_STAGE_FIRMWARE);
+    if (result < 0) {
+      return result;
     }
 
-    int contentLength = http.getSize();
-    if (contentLength <= 0) {
-      log("Invalid content length");
-      http.end();
-      return -3;
+    String filename = !_updateInfo.filename.isEmpty()
+                          ? _updateInfo.filename
+                          : extractFilename(url);
+    if (!filename.isEmpty()) {
+      saveFilenamesToEEPROM(filename, _lastInstalledFsFilename);
     }
 
-    WiFiClient *stream = http.getStreamPtr();
+    log("Update complete! Rebooting...");
+    delay(500);
+    ESP.restart();
+    return 1;
+  }
 
-    if (!Update.begin(contentLength)) {
-      log("Not enough space for update");
-      http.end();
-      return -4;
-    }
-
-    log("Installing...");
-
-    int written = 0;
-    int lastPercent = -1;
-    uint8_t buff[512];
-
-    while (http.connected() && written < contentLength) {
-      int available = stream->available();
-      if (available > 0) {
-        int len = stream->readBytes(buff, min(available, (int)sizeof(buff)));
-        Update.write(buff, len);
-        written += len;
-
-        int percent = (written * 100) / contentLength;
-        if (percent != lastPercent) {
-          lastPercent = percent;
-
-          if (_progressCallback) {
-            _progressCallback(percent, written, contentLength);
-          } else if (percent % 10 == 0) {
-            Serial.printf("[OTA] Progress: %d%%\n", percent);
-          }
-        }
+  /**
+   * @brief Download and install a filesystem image (LittleFS / SPIFFS).
+   *
+   * Does NOT reboot — caller is expected to reboot afterwards if no firmware
+   * flash will follow. While this runs, the running firmware should avoid
+   * touching the filesystem (open files become invalid mid-flash).
+   *
+   * @return 1 on success, negative error code on failure.
+   */
+  int updateFilesystem() {
+    if (!_updateInfo.filesystemAvailable ||
+        _updateInfo.filesystemUrl.isEmpty()) {
+      if (!hasUpdate() || !_updateInfo.filesystemAvailable) {
+        log("No filesystem update available");
+        return 0;
       }
-      delay(1);
+    }
+    return doFilesystemUpdate(_updateInfo.filesystemUrl);
+  }
+
+  /**
+   * @brief Download and install filesystem image from a specific URL.
+   *        Lower-level counterpart to doUpdate(url).
+   */
+  int doFilesystemUpdate(const String &url) {
+    int result = downloadAndFlash(url, U_SPIFFS, OTA_STAGE_FILESYSTEM);
+    if (result < 0) {
+      return result;
     }
 
-    http.end();
-
-    if (Update.end(true)) {
-      // Save firmware filename to EEPROM before reboot
-      if (!_updateInfo.filename.isEmpty()) {
-        saveFilenameToEEPROM(_updateInfo.filename);
-      } else {
-        // Extract filename from URL if not already set
-        String filename = extractFilename(url);
-        if (!filename.isEmpty()) {
-          saveFilenameToEEPROM(filename);
-        }
-      }
-
-      log("Update complete! Rebooting...");
-      delay(500);
-      ESP.restart();
-      return 1;
+    String filename = !_updateInfo.filesystemFilename.isEmpty()
+                          ? _updateInfo.filesystemFilename
+                          : extractFilename(url);
+    if (!filename.isEmpty()) {
+      saveFilenamesToEEPROM(_lastInstalledFilename, filename);
     }
 
-    log("Update failed");
-    return -5;
+    log("Filesystem update complete!");
+    return 1;
   }
 
   /**
    * @brief Set periodic check interval
-   * @param interval Interval in milliseconds (0 to disable)
    */
   void setCheckInterval(unsigned long interval) { _checkInterval = interval; }
 
@@ -487,13 +687,9 @@ public:
 
   /**
    * @brief Check if rollback is possible
-   * @return true if can rollback to previous partition, false otherwise
    */
   bool canRollback() {
-    const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *last_invalid = esp_ota_get_last_invalid_partition();
-
-    // Get the next update partition (opposite of current)
     const esp_partition_t *next_partition =
         esp_ota_get_next_update_partition(NULL);
 
@@ -501,14 +697,12 @@ public:
       return false;
     }
 
-    // Can rollback if the other partition exists and is different from last
-    // invalid
     return (next_partition != last_invalid);
   }
 
   /**
    * @brief Rollback to previous firmware version
-   * @return 1 on success (will reboot), 0 if cannot rollback, negative on error
+   *        (Filesystem is not rolled back — there is only one fs partition.)
    */
   int rollback() {
     log("Attempting rollback...");
@@ -540,7 +734,6 @@ public:
 
   /**
    * @brief Mark current firmware as valid (prevent auto-rollback)
-   * @return true on success, false on error
    */
   bool markAsValid() {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -560,7 +753,6 @@ public:
 
   /**
    * @brief Get current boot partition name
-   * @return Partition name (e.g., "ota_0", "ota_1")
    */
   String getBootPartition() {
     const esp_partition_t *partition = esp_ota_get_running_partition();
@@ -572,7 +764,6 @@ public:
 
   /**
    * @brief Get partition where next update will be written
-   * @return Partition name
    */
   String getNextUpdatePartition() {
     const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
@@ -582,41 +773,27 @@ public:
     return "unknown";
   }
 
-  /**
-   * @brief Get current firmware version
-   * @return Version string
-   */
   String getVersion() { return _currentVersion; }
-
-  /**
-   * @brief Get API URL
-   * @return URL string
-   */
   String getUrl() { return _jsonUrl; }
-
-  /**
-   * @brief Get last installed firmware filename from EEPROM
-   * @return Firmware filename string, empty if not set
-   */
   String getLastInstalledFilename() { return _lastInstalledFilename; }
+  String getLastInstalledFsFilename() { return _lastInstalledFsFilename; }
 
   /**
-   * @brief Clear the last installed firmware record from EEPROM
-   * This allows force update to run again even with the same firmware filename
-   * @return true on success, false on error
+   * @brief Clear the last-installed firmware + filesystem records.
+   *        Allows a force update to re-flash the same files.
    */
   bool clearFirmwareRecord() {
     if (!_eepromInitialized) {
       initEEPROM();
     }
 
-    // Clear magic number to invalidate the record
     EEPROM.write(OTA_EEPROM_START_ADDR, 0);
     EEPROM.write(OTA_EEPROM_START_ADDR + 1, 0);
 
     if (EEPROM.commit()) {
       _lastInstalledFilename = "";
-      log("Firmware record cleared from EEPROM");
+      _lastInstalledFsFilename = "";
+      log("Firmware + filesystem records cleared from EEPROM");
       return true;
     }
 
