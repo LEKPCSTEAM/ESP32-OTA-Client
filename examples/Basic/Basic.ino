@@ -13,9 +13,12 @@ const char* WIFI_SSID = "YOUR_SSID";
 const char* WIFI_PASS = "YOUR_PASSWORD";
 
 // OTA Configuration
-#define PROJECT_ID "06afd666-8542-4b61-bcb7-ace3116902e1"
-#define DEVICE_NAME "ESP32-S3"
-#define JSON_URL "http://192.168.1.250:3000/api/update-list?projectId=" PROJECT_ID "&device=" DEVICE_NAME
+#define DEVICE_ID "YOUR_DEVICE_ID"
+#define JSON_URL "https://your-server/api/update-list?deviceId=" DEVICE_ID
+#define DEVICE_KEY ""  // project device key; "" when the project has none
+
+// Root CA (PEM) of the OTA server; nullptr skips verification
+const char* CA_CERT = nullptr;
 
 // Current firmware version
 #define VERSION "1.0.5"
@@ -37,7 +40,10 @@ void setup() {
         delay(500);
     }
     Serial.printf("\nConnected! IP: %s\n\n", WiFi.localIP().toString().c_str());
-    
+
+    ota.setDeviceKey(DEVICE_KEY);
+    ota.setCACert(CA_CERT);
+
     // Check for updates and install if available
     Serial.println("Checking for updates...");
     int result = ota.checkUpdate();
