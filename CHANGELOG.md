@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Check-in: manifest URLs containing `/api/update-list` without `mac=` get
   `mac=<WiFi MAC>&ver=<version>` appended. `setCheckin(bool)` overrides.
 - Device URL `https://<host>/api/update-list?deviceId=<device uuid>`; the
-  project key goes in `X-Device-Key` via `setDeviceKey()`, never in the URL.
+  device key goes in `X-Device-Key` via `setDeviceKey()`, never in the URL.
   The legacy `?projectId=<id>&device=<name>` URL works unchanged.
 - OTA reports: `POST <base>/api/ota-report` with
   `{deviceId, mac, from, to, result, detail?}` when the manifest URL has

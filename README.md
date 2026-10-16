@@ -23,7 +23,7 @@ A lightweight OTA (Over-The-Air) update library for ESP32 with JSON API support.
 ## What's New in 1.2.0
 
 - Device URL `https://<host>/api/update-list?deviceId=<device uuid>` with the
-  project key in `X-Device-Key`; reports carry `deviceId`. The legacy
+  device key in `X-Device-Key`; reports carry `deviceId`. The legacy
   `?projectId=&device=` URL works unchanged — see
   [Migrating from the legacy URL](#migrating-from-the-legacy-url)
 - Signed download URLs (`?exp=&sig=`, valid 1 h): the file identity ignores
@@ -84,7 +84,7 @@ void setup() {
     WiFi.begin("YOUR_SSID", "YOUR_PASSWORD");
     while (!WiFi.isConnected()) delay(100);
 
-    ota.setDeviceKey("YOUR_DEVICE_KEY");  // only when the project has a device key
+    ota.setDeviceKey("YOUR_DEVICE_KEY");  // only when the device has a key
     ota.setCACert(rootCaPem);             // PEM root CA of the server
 
     // Check and update if available
@@ -103,7 +103,7 @@ With ESP32 OTA Web Manager use one of these forms:
 
 | Form                 | URL                                                                   | Device key |
 | -------------------- | --------------------------------------------------------------------- | ---------- |
-| Device URL (v1.2.0+) | `https://<host>/api/update-list?deviceId=<device uuid>`               | `setDeviceKey()`, required when the project has a key |
+| Device URL (v1.2.0+) | `https://<host>/api/update-list?deviceId=<device uuid>`               | `setDeviceKey()`, required when the device has a key |
 | Legacy               | `<base>/api/update-list?projectId=<project id>&device=<device name>` | not used   |
 
 - `deviceId` is the device's UUID from the web manager. Every unit flashed
@@ -676,8 +676,9 @@ Devices already in the field (v1.0.x / v1.1.0) poll the legacy URL without a
 key and without `ver`. The server keeps that URL working, so nothing breaks
 while you migrate. To move them to the device URL:
 
-1. **Collect the IDs.** In the web manager, copy the device's UUID
-   (`deviceId`) and, if the project uses one, the project device key.
+1. **Collect the IDs.** On the device page of the web manager, generate the
+   device key and copy the `env.h` block (`deviceId` URL and key). Every unit
+   running this firmware shares that key.
 2. **Build a bridge firmware.** This is your application built with this
    library (v1.2.0+), the device URL and the key:
 
@@ -686,7 +687,7 @@ while you migrate. To move them to the device URL:
 
    void setup() {
        // ... Wi-Fi ...
-       ota.setDeviceKey("<project device key>");
+       ota.setDeviceKey(OTA_DEVICE_KEY);  // from env.h
        ota.setCACert(rootCaPem);
        ota.checkUpdate();
    }

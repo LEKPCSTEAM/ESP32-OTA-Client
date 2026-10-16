@@ -7,7 +7,7 @@
 
 #define DEVICE_ID "YOUR_DEVICE_ID"
 #define JSON_URL "https://your-server/api/update-list?deviceId=" DEVICE_ID
-#define DEVICE_KEY "" // project device key; "" when the project has none
+#define DEVICE_KEY "" // device key from the web manager; "" when the device has none
 
 // Root CA (PEM) of the OTA server; nullptr skips verification
 const char *CA_CERT = nullptr;
